@@ -10,13 +10,19 @@ import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
-internal const val SDK_VERSION = "1.0.0"
+internal const val SDK_VERSION = "1.1.0"
 internal val EVENT_NAME = Regex("^[A-Za-z][A-Za-z0-9_.:-]{0,79}$")
 private val KEY = Regex("^kma_pk_(live|test)_[A-Za-z0-9]{20,64}$")
 private const val BATCH_SIZE = 50
 private const val FLUSH_AT = 30
 internal const val HEARTBEAT_MS = 60_000L
 private const val MAX_PROPERTIES_BYTES = 32_000
+internal const val REFERRER_TIMEOUT_MS = 10_000L
+private const val MAX_HELD_OPENS = 10
+private val CURRENCY = Regex("[A-Za-z]{3}")
+// The properties a payment event carries; reports read revenue from them.
+private val REVENUE_KEYS = listOf("kma_revenue", "kma_currency", "kma_product_id", "kma_transaction_id")
+private const val MAX_REVENUE = 1_000_000_000.0
 
 internal fun uuid(): String = UUID.randomUUID().toString()
 
@@ -151,6 +157,18 @@ internal class KmaClient(
     @Volatile private var stopped = false
     private val loaded = CountDownLatch(1)
 
+    // Attribution: the install call of the first launch, and links that open the app.
+    val deepLinks = DeepLinkRouter(platform.main)
+    private var install: PendingInstall? = null
+    private var newInstall = false
+    private var launched = false
+    private var installTried = false
+    private var installBusy = false
+    private var installSent = false
+    private var deviceKey: String? = null
+    private var deviceKeyRead = false
+    private val heldOpens = ArrayList<Pair<String, Long>>()
+
     init {
         require(KEY.matches(key)) { "KissMyApps needs a client key that starts with kma_pk_" }
         this.options = options
@@ -168,6 +186,42 @@ internal class KmaClient(
             return@later
         }
         enqueue(name, clean(properties), ensureSession())
+    }
+
+    /**
+     * A payment in major units (negative for a refund) and its ISO 4217 code, sent as an event
+     * with kma_revenue and kma_currency. An amount or currency that is not valid sends nothing.
+     */
+    fun revenue(
+        amount: Double,
+        currency: String,
+        productId: String?,
+        transactionId: String?,
+        event: String?,
+        properties: Map<String, Any?>,
+    ) {
+        if (!amount.isFinite() || amount == 0.0 || Math.abs(amount) > MAX_REVENUE) {
+            return warn("revenue needs an amount that is not 0 and at most 1,000,000,000 either way (negative for a refund).")
+        }
+        val code = currency.trim()
+        if (!CURRENCY.matches(code)) return warn("revenue needs a three-letter currency code such as USD, not \"$currency\".")
+        val values = LinkedHashMap<String, Any?>(properties)
+        for (field in REVENUE_KEYS) values.remove(field)
+        values["kma_revenue"] = amount
+        values["kma_currency"] = code.uppercase(Locale.ROOT)
+        val product = revenueId(productId)
+        val transaction = revenueId(transactionId)
+        if (product != null) {
+            values["kma_product_id"] = product
+        } else if (productId != null) {
+            warn("productId must be 1 to 200 characters; it was left out.")
+        }
+        if (transaction != null) {
+            values["kma_transaction_id"] = transaction
+        } else if (transactionId != null) {
+            warn("transactionId must be 1 to 200 characters; it was left out.")
+        }
+        track(if (event.isNullOrEmpty()) (if (amount > 0) "purchase" else "refund") else event, values)
     }
 
     fun screen(name: String, properties: Map<String, Any?>) {
@@ -193,6 +247,7 @@ internal class KmaClient(
         val user = id.trim()
         if (user.isEmpty() || user.length > 200) return warn("identify needs a user ID of 1 to 200 characters.")
         later {
+            if (optedOut || stopped) return@later
             userId = user
             if (newTraits != null) mergeTraits(newTraits)
             identityPending = true
@@ -202,6 +257,7 @@ internal class KmaClient(
     }
 
     fun setTraits(newTraits: Map<String, Any?>) = later {
+        if (optedOut || stopped) return@later
         mergeTraits(newTraits)
         identityPending = true
         save()
@@ -210,6 +266,7 @@ internal class KmaClient(
 
     /** Forgets the user, for example on sign out: what follows is a new person and session. */
     fun reset() = later {
+        if (optedOut || stopped) return@later
         sendQueued()
         userId = null
         traits = null
@@ -223,14 +280,55 @@ internal class KmaClient(
 
     fun optOut() = later {
         optedOut = true
+        clearConsentData()
+    }
+
+    private fun clearConsentData() {
         queue.clear()
-        save()
+        heldOpens.clear()
+        deepLinks.clearHeld()
+        userId = null
+        traits = null
+        identityPending = false
+        session = null
+        screenName = null
+        firstLaunch = false
+        newInstall = false
+        install = null
+        saveInstall()
+        writeNow()
     }
 
     fun optIn() = later {
+        if (!optedOut) return@later
+        anonymousId = uuid()
         optedOut = false
         save()
     }
+
+    /**
+     * A link opened the app. On the first launch it goes with the install call; otherwise
+     * it is sent on its own once the launch is under way. False for anything but an https link.
+     */
+    fun handleDeepLink(url: String): Boolean {
+        val link = attributionUrl(url) ?: return false
+        val openedAt = platform.now()
+        later {
+            if (stopped || optedOut) return@later
+            val pending = install
+            if (newInstall && pending != null && !pending.done && !installSent && pending.linkUrl == null) {
+                pending.linkUrl = link
+                saveInstall()
+                return@later
+            }
+            if (heldOpens.size < MAX_HELD_OPENS) heldOpens.add(link to openedAt)
+            sendHeldOpens()
+        }
+        return true
+    }
+
+    /** Deep links go to this listener on the main thread; one that came earlier is handed over now. */
+    fun onDeepLink(listener: DeepLinkListener?) = deepLinks.setListener(listener)
 
     fun flush() = later { sendQueued() }
 
@@ -268,6 +366,7 @@ internal class KmaClient(
         val launch = foregroundAt == 0L
         inForeground = true
         foregroundAt = platform.now()
+        if (launch) launched = true
         if (optedOut) return@later
         val current = ensureSession()
         if (options.trackLifecycle) {
@@ -275,6 +374,9 @@ internal class KmaClient(
             enqueue("app_opened", JSONObject().put("from_background", !launch), current)
         }
         if (heartbeatTask == null) scheduleHeartbeat()
+        // After app_installed is queued: the install call, then any link that opened the app.
+        if (launch) startInstall()
+        sendHeldOpens()
     }
 
     /** The app went to the background: record it and send what is queued while it can. */
@@ -334,6 +436,8 @@ internal class KmaClient(
         // Nothing saved means a first launch, or the app's data was cleared.
         firstLaunch = savedId == null
         identityPending = traits != null
+        loadInstall(store)
+        if (optedOut) clearConsentData()
         loaded.countDown()
         // What an earlier launch could not send goes now.
         if (queue.isNotEmpty()) scheduleFlush(0)
@@ -397,6 +501,31 @@ internal class KmaClient(
         }
     }
 
+    /** A first launch starts the install call; a later one picks up a call not done yet. */
+    private fun loadInstall(store: Store?) {
+        newInstall = firstLaunch
+        if (newInstall) {
+            install = PendingInstall(installedAt = isoTime(platform.now()))
+            saveInstall()
+            return
+        }
+        install = try {
+            store?.read("$storageName-attribution")?.let { PendingInstall.fromJson(JSONObject(it)) }
+        } catch (error: Exception) {
+            warn("Saved install attribution could not be read: $error")
+            null
+        }
+    }
+
+    private fun saveInstall() {
+        val store = platform.store ?: return
+        try {
+            store.write("$storageName-attribution", install?.toJson()?.toString() ?: "{}")
+        } catch (error: Exception) {
+            warn("Install attribution could not be saved: $error")
+        }
+    }
+
     private fun mergeTraits(newTraits: Map<String, Any?>) {
         val merged = traits?.let { JSONObject(it.toString()) } ?: JSONObject()
         val extra = clean(newTraits)
@@ -440,6 +569,9 @@ internal class KmaClient(
         save()
         scheduleFlush(if (queue.size >= FLUSH_AT) 0 else options.flushIntervalSeconds * 1000L)
     }
+
+    /** A product or transaction ID as reports keep it: text of 1 to 200 characters. */
+    private fun revenueId(value: String?): String? = value?.trim()?.takeIf { it.isNotEmpty() && it.length <= 200 }
 
     private fun clean(properties: Map<String, Any?>): JSONObject {
         return try {
@@ -520,7 +652,7 @@ internal class KmaClient(
                 retryLater()
                 return
             }
-            val refused = response.status in 400..499 && response.status != 408 && response.status != 429
+            val refused = refused(response.status)
             val ok = response.status in 200..299
             if (!ok && !refused) {
                 retryLater()
@@ -578,6 +710,144 @@ internal class KmaClient(
             lastSent = platform.now()
         } catch (_: Exception) {
         }
+    }
+
+    private fun refused(status: Int) = status in 400..499 && status != 408 && status != 429
+
+    // Attribution ---------------------------------------------------------------------------
+
+    /** Once per launch while the install call is not done: read the referrer, then send. */
+    private fun startInstall() {
+        val pending = install ?: return
+        if (pending.done || installTried || installBusy || optedOut || stopped) return
+        installTried = true
+        installBusy = true
+        val source = platform.attribution
+        if (source == null || pending.referrerRead) return sendInstall()
+        var answered = false
+        val timeout = platform.scheduler.schedule(REFERRER_TIMEOUT_MS) {
+            if (answered) return@schedule
+            answered = true
+            warn("Google Play's install referrer did not answer in time; the install is sent without it.")
+            sendInstall()
+        }
+        val take: (InstallReferrer?) -> Unit = { details ->
+            later {
+                if (!answered) {
+                    answered = true
+                    timeout.cancel()
+                    pending.referrer = details
+                    pending.referrerRead = true
+                    saveInstall()
+                    sendInstall()
+                }
+            }
+        }
+        try {
+            source.installReferrer(take)
+        } catch (error: Exception) {
+            warn("The install referrer could not be read: $error")
+            take(null)
+        }
+    }
+
+    private fun sendInstall() {
+        val pending = install
+        if (pending == null || pending.done || stopped || optedOut) return finishInstall()
+        // The install belongs to the person and session of its launch, also when it is tried again later.
+        val person = pending.anonymousId ?: anonymousId
+        val sessionId = pending.sessionId ?: ensureSession().id
+        pending.anonymousId = person
+        pending.sessionId = sessionId
+        val body = installBody(
+            anonymousId = person,
+            sessionId = sessionId,
+            platform = platform.device().platform,
+            installedAt = pending.installedAt,
+            sdk = platform.sdk,
+            userId = if (person == anonymousId) userId else null,
+            appVersion = options.appVersion,
+            deviceKey = deviceKey(),
+            linkUrl = pending.linkUrl,
+            referrer = pending.referrer,
+        )
+        installSent = true
+        saveInstall()
+        val response = try {
+            platform.transport.post("$endpoint/v1/attribution/install", key, body.toString())
+        } catch (_: Exception) {
+            null
+        }
+        var answer: AttributionAnswer? = null
+        if (response != null && response.status in 200..299) {
+            pending.done = true
+            answer = parseAttributionAnswer(response.text, pending.linkUrl)
+            if (answer == null) warn("The install call's answer could not be read: ${response.text}")
+        } else if (response != null && refused(response.status)) {
+            pending.done = true
+            warn("The install call was refused (${response.status}): ${response.text}")
+        } else {
+            pending.attempts += 1
+            if (pending.attempts >= PendingInstall.MAX_ATTEMPTS) {
+                pending.done = true
+                warn("The install call failed ${pending.attempts} times and is given up.")
+            } else {
+                warn("The install call failed; it is tried again on the next launch.")
+            }
+        }
+        saveInstall()
+        answer?.deepLink?.let { deepLinks.deliver(it) }
+        finishInstall()
+    }
+
+    private fun finishInstall() {
+        installBusy = false
+        sendHeldOpens()
+    }
+
+    /** Links wait until the launch is under way and its install call, if any, is answered. */
+    private fun sendHeldOpens() {
+        if (!launched || installBusy) return
+        while (heldOpens.isNotEmpty()) {
+            val (url, openedAt) = heldOpens.removeAt(0)
+            sendOpen(url, openedAt)
+        }
+    }
+
+    private fun sendOpen(url: String, openedAt: Long) {
+        if (stopped || optedOut) return
+        val body = openBody(
+            anonymousId = anonymousId,
+            sessionId = ensureSession().id,
+            platform = platform.device().platform,
+            url = url,
+            openedAt = isoTime(openedAt),
+            sdk = platform.sdk,
+            userId = userId,
+            appVersion = options.appVersion,
+            deviceKey = deviceKey(),
+        )
+        val response = try {
+            platform.transport.post("$endpoint/v1/attribution/open", key, body.toString())
+        } catch (error: Exception) {
+            return warn("A link open could not be sent: $error")
+        }
+        if (response.status !in 200..299) return warn("A link open was refused (${response.status}): ${response.text}")
+        val answer = parseAttributionAnswer(response.text, url)
+            ?: return warn("A link open's answer could not be read: ${response.text}")
+        answer.deepLink?.let { deepLinks.deliver(it) }
+    }
+
+    private fun deviceKey(): String? {
+        if (!deviceKeyRead) {
+            deviceKeyRead = true
+            deviceKey = try {
+                validDeviceKey(platform.attribution?.deviceKey())
+            } catch (_: Exception) {
+                null
+            }
+        }
+        return deviceKey
     }
 
     private fun warn(message: String) {

@@ -48,6 +48,13 @@ final class MemoryStore: Store {
     var data: [String: String] = [:]
     func read(_ name: String) -> String? { data[name] }
     func write(_ name: String, _ value: String) { data[name] = value }
+
+    /// A phone that ran the app with SDK 1.0 before: not an install, so no install call.
+    static func returning() -> MemoryStore {
+        let store = MemoryStore()
+        store.data["kma-\(key.suffix(8))"] = #"{"anonymousId":"5f0c7a9e-3b1d-4c2a-9e8f-1a2b3c4d5e6f","version":"2.4.0","build":"120"}"#
+        return store
+    }
 }
 
 let iphone = DeviceInfo(
@@ -62,7 +69,8 @@ let iphone = DeviceInfo(
     language: "en-NG"
 )
 
-private let contract: [String: Any] = {
+/// integrations/analytics-mobile/contract/app-events.json, the rules every app SDK is held to.
+let contract: [String: Any] = {
     let url = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent() // KissMyAppsTests
         .deletingLastPathComponent() // Tests
@@ -79,7 +87,7 @@ private func rules(_ name: String) -> (required: [String], allowed: [String]) {
     return (required, required + (rule["optional"] as? [String] ?? []))
 }
 
-private func matchesPattern(_ pattern: String, _ text: String) -> Bool {
+func matchesPattern(_ pattern: String, _ text: String) -> Bool {
     text.range(of: pattern, options: .regularExpression) != nil
 }
 
@@ -107,17 +115,51 @@ func expectContract(_ body: [String: Any], file: StaticString = #filePath, line:
     }
 }
 
+/// The reserved revenue properties, from the contract's revenue section.
+func expectRevenueContract(_ properties: [String: Any], file: StaticString = #filePath, line: UInt = #line) {
+    let revenue = contract["revenue"] as! [String: Any]
+    let fields = revenue["properties"] as! [String: Any]
+    for field in fields["required"] as! [String] { XCTAssertNotNil(properties[field], field, file: file, line: line) }
+    let amount = (properties["kma_revenue"] as! NSNumber).doubleValue
+    XCTAssertTrue(amount.isFinite && amount != 0, file: file, line: line)
+    XCTAssertLessThanOrEqual(abs(amount), (revenue["max_amount"] as! NSNumber).doubleValue, file: file, line: line)
+    XCTAssertTrue(matchesPattern(revenue["kma_currency"] as! String, properties["kma_currency"] as! String), file: file, line: line)
+    let longest = (revenue["id_max_length"] as! NSNumber).intValue
+    for field in fields["optional"] as! [String] {
+        guard let value = properties[field] else { continue }
+        let id = value as! String
+        XCTAssertFalse(id.isEmpty, field, file: file, line: line)
+        XCTAssertLessThanOrEqual(id.count, longest, field, file: file, line: line)
+    }
+}
+
 struct Offline: Error {}
 
+/// What /v1/attribution/install and /open answer while attribution is off for the project.
+let attributionOff = #"{"matched":false,"method":"off","deep_link":null}"#
+
 final class FakeTransport: Transport {
+    /// The /v1/events bodies.
     var sent: [[String: Any]] = []
+    /// Every request, events and attribution calls, in order.
+    var calls: [(path: String, body: [String: Any])] = []
     var answer: () throws -> Response = { Response(status: 200, text: "{}") }
+    var attributionAnswer: (String) throws -> Response = { _ in Response(status: 200, text: attributionOff) }
 
     func post(url: URL, key postedKey: String, body: Data) throws -> Response {
-        XCTAssertEqual(url.absoluteString, "https://events.kissmyapps.dev/v1/events")
         XCTAssertEqual(postedKey, key)
-        sent.append(try JSONSerialization.jsonObject(with: body) as! [String: Any])
-        return try answer()
+        let json = try JSONSerialization.jsonObject(with: body) as! [String: Any]
+        calls.append((url.path, json))
+        if url.path == "/v1/events" {
+            XCTAssertEqual(url.absoluteString, "https://events.kissmyapps.dev/v1/events")
+            sent.append(json)
+            return try answer()
+        }
+        XCTAssertTrue([
+            "https://events.kissmyapps.dev/v1/attribution/install",
+            "https://events.kissmyapps.dev/v1/attribution/open",
+        ].contains(url.absoluteString), url.absoluteString)
+        return try attributionAnswer(url.path)
     }
 }
 
@@ -149,7 +191,7 @@ final class ClientTests: XCTestCase {
             transport: transport,
             scheduler: scheduler,
             device: { iphone },
-            sdk: "kma-ios/1.0.0",
+            sdk: "kma-ios/\(sdkVersion)",
             now: { scheduler.now },
             log: { [weak self] in self?.logs.append($0) }
         )
@@ -206,7 +248,7 @@ final class ClientTests: XCTestCase {
             XCTAssertEqual((body["session"] as? [String: Any])?["id"] as? String, client.getSessionId())
             let context = body["context"] as! [String: Any]
             XCTAssertEqual(context["platform"] as? String, "ios")
-            XCTAssertEqual(context["sdk"] as? String, "kma-ios/1.0.0")
+            XCTAssertEqual(context["sdk"] as? String, "kma-ios/1.1.0")
             XCTAssertEqual(context["app_version"] as? String, "2.4.0")
             XCTAssertEqual(context["page_path"] as? String, "Home")
             XCTAssertEqual(context["device_model"] as? String, "iPhone15,4")
@@ -290,7 +332,8 @@ final class ClientTests: XCTestCase {
     }
 
     func testDropsABatchTheServerRefusesButRetriesWhenItIsBusy() throws {
-        let client = try start(MemoryStore())
+        // A later launch: on the first, the install call sends the queue early.
+        let client = try start(MemoryStore.returning())
         transport.answer = { Response(status: 503, text: "busy") }
         client.foreground()
         settle(10_000)
@@ -350,6 +393,9 @@ final class ClientTests: XCTestCase {
 
         let next = try start(store)
         next.foreground()
+        next.identify("private", traits: ["private": true])
+        next.setTraits(["private": true])
+        next.reset()
         next.track("still_hidden", properties: [:])
         settle(10_000)
         XCTAssertEqual(sent.count, 0)
@@ -357,6 +403,7 @@ final class ClientTests: XCTestCase {
         next.track("visible", properties: [:])
         settle(10_000)
         XCTAssertEqual(names(), ["session_started", "visible"])
+        XCTAssertTrue(sent.allSatisfy { $0["user_id"] == nil && $0["traits"] == nil })
     }
 
     func testKeepsAnOpenAppOnlineWithAHeartbeat() throws {
@@ -387,6 +434,82 @@ final class ClientTests: XCTestCase {
         client.track("valid_name", properties: [:])
         settle(10_000)
         XCTAssertEqual(names(), ["session_started", "valid_name"])
+        XCTAssertTrue(logs.contains { $0.contains("not a valid event name") })
+    }
+
+    func testSendsAPaymentAndARefundWithTheReservedPropertiesWhichWinOverExtras() throws {
+        let client = try start(MemoryStore(), options: KissMyAppsOptions(trackLifecycle: false))
+        client.foreground()
+        client.revenue(
+            Decimal(string: "59.99")!,
+            currency: "usd",
+            productId: "annual",
+            transactionId: "2000000812345678",
+            event: nil,
+            properties: ["plan": "annual", "kma_revenue": 1, "kma_currency": "GBP", "kma_product_id": "x"]
+        )
+        client.revenue(
+            Decimal(string: "-59.99")!, currency: "USD", productId: nil, transactionId: "2000000812345678", event: nil,
+            properties: [:]
+        )
+        client.revenue(
+            Decimal(string: "4.5")!, currency: "EUR", productId: nil, transactionId: nil, event: "coins_bought",
+            properties: ["kma_transaction_id": "x"]
+        )
+        settle(10_000)
+
+        XCTAssertEqual(names(), ["session_started", "purchase", "refund", "coins_bought"])
+        let revenue = contract["revenue"] as! [String: Any]
+        let defaults = revenue["default_event"] as! [String: String]
+        XCTAssertEqual(names()[1], defaults["payment"])
+        XCTAssertEqual(names()[2], defaults["refund"])
+        let all = events()
+        let purchase = properties(all[1])
+        XCTAssertEqual(Set(purchase.keys), ["plan", "kma_revenue", "kma_currency", "kma_product_id", "kma_transaction_id"])
+        XCTAssertEqual((purchase["kma_revenue"] as? NSNumber)?.doubleValue ?? 0, 59.99, accuracy: 0.000_001)
+        XCTAssertEqual(purchase["kma_currency"] as? String, "USD")
+        XCTAssertEqual(purchase["kma_product_id"] as? String, "annual")
+        XCTAssertEqual(purchase["kma_transaction_id"] as? String, "2000000812345678")
+        XCTAssertEqual(purchase["plan"] as? String, "annual")
+        let refund = properties(all[2])
+        XCTAssertEqual(Set(refund.keys), ["kma_revenue", "kma_currency", "kma_transaction_id"])
+        XCTAssertEqual((refund["kma_revenue"] as? NSNumber)?.doubleValue ?? 0, -59.99, accuracy: 0.000_001)
+        let coins = properties(all[3])
+        XCTAssertEqual(Set(coins.keys), ["kma_revenue", "kma_currency"])
+        XCTAssertEqual((coins["kma_revenue"] as? NSNumber)?.doubleValue ?? 0, 4.5, accuracy: 0.000_001)
+        XCTAssertEqual(coins["kma_currency"] as? String, "EUR")
+        for event in all.dropFirst() { expectRevenueContract(properties(event)) }
+        for body in sent { expectContract(body) }
+    }
+
+    func testSendsNothingForAnAmountOrCurrencyThatIsNotValid() throws {
+        let client = try start(MemoryStore(), options: KissMyAppsOptions(trackLifecycle: false, debug: true))
+        client.foreground()
+        for amount in [Decimal(0), Decimal.nan, Decimal(1_000_000_001), Decimal(-2_000_000_000)] {
+            client.revenue(amount, currency: "USD", productId: nil, transactionId: nil, event: nil, properties: [:])
+        }
+        for currency in ["US", "USDT", "", "U$D", "\u{DC}SD", "US\n"] {
+            client.revenue(9, currency: currency, productId: nil, transactionId: nil, event: nil, properties: [:])
+        }
+        client.revenue(1_000_000_000, currency: "USD", productId: nil, transactionId: nil, event: nil, properties: [:])
+        client.revenue(-1_000_000_000, currency: " gbp\n", productId: nil, transactionId: nil, event: nil, properties: [:])
+        client.revenue(
+            2, currency: "USD", productId: "  ", transactionId: String(repeating: "x", count: 201), event: "",
+            properties: [:]
+        )
+        client.revenue(2, currency: "USD", productId: nil, transactionId: nil, event: "not valid!", properties: [:])
+        settle(10_000)
+
+        XCTAssertEqual(names(), ["session_started", "purchase", "refund", "purchase"])
+        let all = events()
+        XCTAssertEqual((properties(all[1])["kma_revenue"] as? NSNumber)?.doubleValue ?? 0, 1_000_000_000, accuracy: 0.000_001)
+        XCTAssertEqual(properties(all[2])["kma_currency"] as? String, "GBP")
+        XCTAssertEqual((properties(all[2])["kma_revenue"] as? NSNumber)?.doubleValue ?? 0, -1_000_000_000, accuracy: 0.000_001)
+        XCTAssertEqual(Set(properties(all[3]).keys), ["kma_revenue", "kma_currency"])
+        XCTAssertEqual(logs.filter { $0.contains("revenue needs an amount") }.count, 4)
+        XCTAssertEqual(logs.filter { $0.contains("three-letter currency") }.count, 6)
+        XCTAssertTrue(logs.contains { $0.contains("productId must be") })
+        XCTAssertTrue(logs.contains { $0.contains("transactionId must be") })
         XCTAssertTrue(logs.contains { $0.contains("not a valid event name") })
     }
 
